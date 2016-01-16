@@ -1,0 +1,656 @@
+#!/usr/bin/perl
+###########################################################################
+# kickbutt - button to kick-off some action(s)
+#
+# Author: Jeremy Slade
+###########################################################################
+
+use strict;
+
+use IO::File;
+use IO::Pipe;
+use Tk;
+use Carp;
+use File::Basename;
+use POSIX ":sys_wait_h";
+use Getopt::Std;
+use YAML;
+use XML::Smart;
+
+
+###########################################################################
+# Process command line
+###########################################################################
+
+
+my $HISTMAX = 100;
+
+
+###########################################################################
+# Main
+###########################################################################
+
+my %opt = ();
+getopts ( 'g:t:', \%opt );
+
+# Read history
+my $hist = [];
+my $histIndex = 0;
+my %histModifiedTime = ();
+my $loadCfg = shift;
+my $histFile = $ENV{HOME} ."/.kickbutt.hist";
+
+
+my %buttons = ();
+
+# Create gui, start w/ one empty button
+my $mw = new MainWindow();
+$mw->geometry ( $opt{g} ) if defined $opt{g};
+
+my $title = "kickb";
+$title .= ': '. $opt{t} if $opt{t};
+$mw->title($title);
+
+
+# Check for modified history automatically
+readHistory( $histFile, 0 );
+$mw->repeat ( 5000, sub { readHistory ( $histFile, 0 ); } );
+
+
+if ( defined($loadCfg) ) {
+  if ( !-r $loadCfg ) {
+    STDERR->printf ( "ERROR: Can't read $loadCfg: no such file\n" );
+    exit 1;
+  }
+  readHistory( $loadCfg, 1 );
+
+  $title .= ': ' . basename($loadCfg,'.kickbutt');
+  $mw->title($title);
+}
+
+my ($c,$r) = $mw->gridSize();
+if ( $r == 0 && $c == 0 ) {
+  addColumnAndButton();
+}
+
+my @queue = ();
+my %pids = ();
+my %pid_results = ();
+
+sub REAPER {
+  my $pid = wait;
+  my $result = $?;
+  $pid_results{$pid} = $result unless $pid == -1;
+  if ( exists $pids{$pid} ) {
+    $pids{$pid}{RESULT} = $result;
+  }
+  $SIG{CHLD} = \&REAPER;
+};
+$SIG{CHLD} = \&REAPER;
+
+
+# Event loop
+MainLoop;
+
+
+###########################################################################
+# SUBROUTINES
+###########################################################################
+
+######################################################################
+# addColumnAndButton ()
+#
+# Add a new column to the main window, and add a button to it.
+######################################################################
+sub addColumnAndButton
+{
+  my (%opt) = @_;
+
+  # Add a new column, and put the button in the first row
+  my ($c,$r) = $mw->gridSize();
+  $r = 0;
+  $opt{at} = "$r,$c";
+
+  addButton ( %opt );
+}
+
+
+######################################################################
+# addButton ( label, command )
+#
+######################################################################
+sub addButton
+{
+  my ( %opt ) = @_;
+  my $label = $opt{label};
+  my $cmd = $opt{cmd};
+
+  # Determine location
+  my ($r,$c);
+  if ( !$opt{at} ) {
+    # Find row in last column that is empty
+    my ($lastc,$lastr) = $mw->gridSize();
+    #printf ( "Add button: last r=$lastr, c=$lastc\n" );
+    $c = $lastc? $lastc-1 : 0;
+    for ( $r=0; $r <= $lastr; $r++ ) {
+      last unless $mw->gridSlaves( -row => $r, -column => $c );
+    }
+    printf ( "Add button: new  r=$r, c=$c\n" );
+    $opt{at} = "$r,$c";
+  }
+  ($r,$c) = split(/,/, $opt{at});
+
+  # Remove the button already at the location if there is one
+  if ( my $existing = $mw->gridSlaves( -row => $r, -column => $c ) ) {
+    eval { $existing->gridForget(); };
+  }
+
+  # Create the new button
+  my $butt = $mw->Button( -relief => 'flat', -borderwidth => 1,
+			  -padx => -2, -pady => -2 );
+  my $cfg = $butt->{CFG} = { label => $label, cmd => $cmd };
+  $butt->configure ( -textvariable => \$cfg->{label} );
+
+  $butt->bind ( '<Button-1>',
+		sub { doCommand ( $butt ); } );
+  $butt->bind ( '<Shift-Button-1>',
+		sub { doCommand ( $butt, wait => 1 ) } );
+  $butt->bind ( '<Control-Button-1>',
+		sub { killCommands ( $butt ); abortQueue(); } );
+
+  my $popupMenu = $butt->{POPUP} = $mw->Menu
+    ( -tearoff => 0, -menuitems =>
+      [ [ command => 'config',
+	  -command => sub { configureButton ( $butt ) } ],
+	[ command => 'add row',
+	  -command => sub { addButton ( at => ($r+1).",$c" ) } ],
+	[ command => 'add col',
+	  -command => sub { addColumnAndButton() } ],
+	[ command => 'remove',
+	  -command => sub { removeButton ( $butt ) } ],
+	'',
+	[ command => 'save cfg',
+	  -command => sub { saveConfig(); } ],
+      ] );
+	
+  $butt->bind ( '<3>' => sub { $popupMenu->Popup
+				 ( qw/-popover cursor -popanchor nw/ ) } );
+
+  $butt->{ROW} = $r;
+  $butt->{COL} = $c;
+  $buttons{"$r,$c"} = $butt;
+
+  updateButton ( $butt, %opt );
+
+  if ( $label eq '' || $cmd eq '' ) { configureButton ( $butt ); }
+}
+
+
+######################################################################
+# removeButton ()
+#
+######################################################################
+sub removeButton
+{
+  my ($butt) = @_;
+  my ($r, $c) =  ($butt->{ROW},$butt->{COL});
+  delete $buttons{"$r,$c"};
+  $butt->gridForget();
+}
+
+
+######################################################################
+# updateButton ()
+#
+# Update the button with the given configuration
+######################################################################
+sub updateButton
+{
+  my ($butt, %opt) = @_;
+
+  my $cfg = $butt->{CFG};
+  map { $cfg->{$_} = $opt{$_} unless /^_/ } keys %opt;
+
+  # location in grid
+  if ( exists($opt{at}) ) {
+    my ($r,$c) = split(/,/, $opt{at});
+    $butt->grid( -row => $r, -column => $c );
+  } else {
+    $butt->grid();
+  }
+
+  # Remember original bg color
+  $butt->{OLD_BG} = $butt->cget( '-bg' ) unless defined $butt->{OLD_BG};
+
+  if ( exists($opt{_color}) ) {
+    $butt->configure ( -bg => $opt{_color} );
+  }
+  elsif ( exists($butt->{RESULT}) &&
+	  $butt->{RESULT} ne '0' ) {
+    $butt->configure ( -bg => 'red' );
+  } else {
+    $butt->configure ( -bg => $butt->{OLD_BG} );
+  }
+
+  # Auto-expand
+  $butt->gridConfigure ( -sticky => 'nsew' );
+}
+
+
+######################################################################
+# configureButton ( mw, button )
+#
+# Set the label, action, etc for a button
+######################################################################
+sub configureButton
+{
+  my ($butt) = @_;
+
+  # Create the configure gui
+  my $cfg = createConfigWindow ( $butt );
+
+  # Now display the window
+  $cfg->deiconify();
+  $cfg->raise();
+  $cfg->focusForce();
+}
+
+
+######################################################################
+# createConfigWindow ( mw, butt )
+#
+# Create window for configuring the given button
+######################################################################
+sub createConfigWindow
+{
+  my ($butt) = @_;
+
+  # Reuse single top-level window
+  my $cfg = $mw->{CONFIG_WIN};
+  if ( !$cfg ) {
+    $cfg = $mw->{CONFIG_WIN} = $mw->Toplevel();
+    $cfg->title ( $mw->title() .": Configure\n" );
+
+    my $f1 = $cfg->Frame()->pack( -fill=>'x', -padx => 2, -pady => 2 );
+    my $f2 = $cfg->Frame()->pack( -fill=>'x', -padx => 2, -pady => 2 );
+    my $f3 = $cfg->Frame()->pack( -fill=>'x', -padx => 2, -pady => 2 );
+
+    $f1->Label ( -width => 12, -text => 'Label', -anchor => 'w' )
+      ->pack (  -side => 'left' );
+    my $l = $cfg->{labEntry} = $f1->Entry ( -width => 80, -text => '' )
+      ->pack ( -side => 'right' );
+
+    $f2->Label ( -width => 12, -text => 'Command', -anchor => 'w' )
+      ->pack ( -padx => 2, -pady => 2, -side => 'left' );
+    my $c = $cfg->{cmdEntry} = $f2->Entry ( -width => 80, -text => '' )
+      ->pack ( -side => 'right' );
+
+    $f3->Label ( -width => 12, -text => 'Show output', -anchor => 'w' )
+      ->pack ( -padx => 2, -pady => 2, -side => 'left' );
+    my $o = $cfg->{outputCheck} = $f3->Checkbutton ( )
+      ->pack ( -side => 'left' );
+    $o->deselect ();
+
+    my $b = $cfg->{dismiss} = $cfg->Button ( -text => 'Dismiss' )
+      ->pack ( -anchor => 'w' );
+
+    $l->bind ( '<Key-Return>', sub { $c->focus(); } );
+    $c->bind ( '<Key-Return>', sub { $b->invoke(); } );
+
+  }
+
+
+  # Set up specifics for this button
+  my $labEntry = $cfg->{labEntry};
+  $labEntry->configure ( -textvariable => \$butt->{CFG}{label} );
+  $labEntry->bind ( '<Key-Up>', sub { prevInHistory( $butt ) } );
+  $labEntry->bind ( '<Key-Down>', sub { nextInHistory( $butt ) } );
+
+  my $cmdEntry = $cfg->{cmdEntry};
+  $cmdEntry->configure ( -textvariable => \$butt->{CFG}{cmd} );
+  $cmdEntry->bind ( '<Key-Up>', sub { prevInHistory( $butt ) } );
+  $cmdEntry->bind ( '<Key-Down>', sub { nextInHistory( $butt ) } );
+
+
+  $cfg->{options}= $butt->{OPTIONS};
+  my $dismiss = $cfg->{dismiss};
+  $dismiss->configure ( -command => sub {
+			  addToHistory ( $butt );
+			  $cfg->withdraw();
+			} );
+
+  return $cfg;
+}
+
+
+######################################################################
+# doCommand ( button )
+#
+######################################################################
+sub doCommand
+{
+  my ($butt, %opt) = @_;
+
+
+  delete $butt->{RESULT};
+  my $cmd = $butt->{CFG}{cmd};
+  return if ( $cmd eq '' );
+
+  $cmd =~ s/\s*\&\s*$//;
+
+  # Put it on the queue if requested to wait
+  if ( $opt{wait} && scalar keys %pids ) {
+    # Something's already executing, wait for it to finish
+    delete $opt{wait};
+    push @queue, [ $butt, %opt ];
+    STDERR->printf ( "queued: $butt->{LABEL}\n" );
+    updateButton ( $butt, _color => 'orange' );
+    return;
+  }
+
+  # Execute it
+  my $pid = fork;
+  if ( !defined $pid ) {
+    STDERR->printf ( "%s: Can't fork\n", basename($0) );
+    return;
+  }
+
+  elsif ( $pid ) {
+    # Parent
+    $butt->{PIDS} = {} unless $butt->{PIDS};
+    $butt->{PIDS}{$pid} = $cmd;
+    $pids{$pid} = $butt;
+
+    # Show the button as running
+    updateButton ( $butt, _color => 'cyan' );
+
+    $mw->after ( 1000 => \&checkCommands );
+  }
+
+  else {
+    # Child
+    #STDOUT->printf("KB> $cmd\n");
+    exec $cmd;
+    STDERR->printf ( "%s: exec failed: $cmd\n", basename($0) );
+    CORE::exit 127; # Exec failed
+  }
+
+}
+
+
+######################################################################
+# Check for any commands that are running to see if they are finished
+#
+######################################################################
+sub checkCommands
+{
+  while ( my ($pid, $butt) = each %pids ) {
+    if ( waitpid( $pid, WNOHANG ) == -1 ) {
+      # Process exited;
+      delete $pids{$pid};
+      delete $butt->{PIDS}{$pid} if $butt->{PIDS};
+
+      my %opt = ();
+      if ( $pid_results{$pid} ne '' &&
+	   $pid_results{$pid} ne '0' ) {
+	abortQueue();
+      }
+      updateButton ( $butt, %opt );
+    }
+  }
+
+  if ( scalar keys %pids ) {
+    $mw->after ( 1000 => \&checkCommands );
+  }
+
+  elsif ( @queue ) {
+    my $cmd = shift @queue;
+    doCommand ( @$cmd );
+  }
+}
+
+
+######################################################################
+# Kill the commands currently running for the given button
+#
+######################################################################
+sub killCommands
+{
+  my ($butt, %opt) = @_;
+
+  my $pids = $butt->{PIDS} || {};
+  my $sig = $opt{sig} || 15;
+  my $signaled = 0;
+  foreach my $pid ( sort keys %$pids ) {
+    next unless kill 0, $pid;
+    printf ( "\n\n\nkill $sig, $pid\n\n\n" );
+    kill $sig, $pid;
+    $signaled++;
+  }
+
+  if ( $signaled && $sig != 9 ) {
+    $mw->after ( 1000 => sub { killCommands ( $butt, %opt, sig => 9 ); } )
+  } else {
+    updateButton ( $butt );
+  }
+}
+
+
+######################################################################
+# Clear out the queue, don't execute any of the queued commands
+#
+######################################################################
+sub abortQueue
+{
+  foreach ( @queue ) {
+    my ($butt,%opt) = @$_;
+    updateButton ( $butt );
+  }
+
+  @queue = ();
+}
+
+
+######################################################################
+# readHistory ( file, exec )
+#
+# Read history entries from file.  Default file is ~/.kickbutt.hist
+######################################################################
+sub readHistory
+{
+  my ($file, $exec) = @_;
+
+  return unless -r $file;
+
+  # Check if file has been modified since last read
+  my $mtime = -M $file;
+  return if ( $mtime == $histModifiedTime{$file} );
+  $histModifiedTime{$file} = $mtime;
+
+  #STDERR->printf ( "Read history: $file\n" );
+
+  my $fh = IO::File->new( $file );
+  my $first = <$fh>;
+  if ( $first =~ /---/ ) {
+    readHistoryAsYAML($file,$exec);
+  } else {
+    readHistoryAsXML($file,$exec);
+  }
+}
+
+
+sub readHistoryAsXML
+{
+  my ($file,$exec) = @_;
+
+  my $xml = XML::Smart->new ( $file );
+  my @hist = ();
+
+  foreach my $x ( $xml->{kickbutt}{item}('@') ) {
+    my %item = ();
+    while ( my ($k, $v) = each %$x ) {
+      $item{$k} = $v . '';
+    }
+    push @hist, \%item;
+
+    addButton ( %item ) if $exec;
+  }
+
+  if ( !$exec ) {
+    $hist = \@hist;
+    $histIndex = -1;
+  }
+
+}
+
+
+sub readHistoryAsYAML
+{
+  my ($file,$exec) = @_;
+
+  my $yaml = YAML::LoadFile($file);
+  my @hist = ();
+
+  foreach my $x ( @$yaml ) {
+    my %item = ();
+    while ( my ($k, $v) = each %$x ) {
+      $item{$k} = $v . '';
+    }
+    push @hist, \%item;
+
+    addButton ( %item ) if $exec;
+  }
+
+  if ( !$exec ) {
+    $hist = \@hist;
+    $histIndex = -1;
+  }
+
+}
+
+
+######################################################################
+# writeHistory ( mw, file )
+#
+# Write the history entries to file.  Default file is ~/.<mod name>
+######################################################################
+sub writeHistory
+{
+  my ($file, $list) = @_;
+
+  #STDERR->printf ( "Write history: $file\n" );
+
+  my $histmode = defined $list? 0 : 1;
+  my @histkeys = qw( label cmd );
+
+  $list = $hist unless defined $list;
+
+  my $fh = new IO::File ( $file, 'w' ) or return;
+  my @yaml = ();
+  foreach my $opt ( @$list ) {
+    my %save = ();
+    if ( $histmode ) {
+      # Only save some keys to history
+      %save = ( map { $_ => $opt->{$_} } @histkeys );
+    } else {
+      %save = ( map { $_ => $opt->{$_} } keys %$opt );
+    }
+    push @yaml, \%save;
+  }
+
+  my @sorted = sort {
+    $a->{at} cmp $b->{at};
+  } @yaml;
+
+  $fh->print(Dump(\@sorted));
+
+  close $fh;
+}
+
+
+######################################################################
+# addToHistory ( $butt )
+#
+# Add a string to the history list
+######################################################################
+sub addToHistory
+{
+  my ($butt) = @_;
+
+  my $cfg = $butt->{CFG};
+  return unless $cfg->{cmd};
+
+  #STDERR->printf ( "Add to history: $cfg->{label} = $cfg->{cmd}\n" );
+
+  my $last = $hist->[-1] || {};
+  pop @$hist if ( $cfg->{label} eq $last->{label} );
+  push @$hist, { %$cfg };
+  $histIndex = -1;
+
+  while ( @$hist > $HISTMAX ) { shift @$hist; }
+
+  # Automatically write the history 
+  $mw->afterIdle ( sub { writeHistory ( $histFile ); } );
+}
+
+
+######################################################################
+# nextInHistory ()
+#
+# Get the next command in the history list
+######################################################################
+sub nextInHistory
+{
+  my ($butt) = @_;
+
+  return unless @$hist;
+
+  my $i = $histIndex + 1;
+  if ( $i > $#$hist ) { $i -= scalar @$hist; }
+  $histIndex = $i;
+
+  my $x = $hist->[$i];
+  updateButton ( $butt, %$x );
+}
+
+
+######################################################################
+# prevInHistory ()
+#
+# Get the prev command in the history list
+######################################################################
+sub prevInHistory
+{
+  my ($butt) = @_;
+
+  return unless @$hist;
+
+  my $i = $histIndex - 1;
+  if ( $i < 0 ) { $i += scalar @$hist; }
+  $histIndex = $i;
+
+  my $x = $hist->[$i];
+  updateButton ( $butt, %$x );
+}
+
+
+######################################################################
+# saveConfig ()
+#
+# Choose a filename to save the current layout
+######################################################################
+sub saveConfig
+{
+  my $fs = $mw->FileSelect ( -filter => '*.kickbutt',
+			     -initialfile => $loadCfg );
+  my $file = $fs->Show();
+  if ( defined($file) && $file ne '' ) {
+    # Get the list of active buttons:
+    my @list = ();
+    foreach my $butt ( values %buttons ) {
+      push @list, $butt->{CFG};
+    }
+    writeHistory ( $file, \@list );
+  }
+}
+
